@@ -1,148 +1,273 @@
+import tkinter as tk
+from tkinter import filedialog
+from PIL import Image, ImageTk, ImageDraw, ImageOps
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from google.cloud import vision
 import os
 import cv2
 import numpy as np
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
-from skimage.feature import local_binary_pattern
-import joblib
-from collections import defaultdict
+import torch.nn.functional as F
 
-# Define the target size
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "genuine-vent-430507-b0-5293ed9cf15e.json"
+
 TARGET_SIZE = 224
 
-# Function to normalize image
-def normalize_image(image):
-    return image.astype(np.float32) / 255.0
+def resize_and_pad_image(image, target_size=TARGET_SIZE):
+    h, w, _ = image.shape
+    if h > target_size or w > target_size:
+        scale = target_size / max(h, w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized_image = cv2.resize(image, (new_w, new_h))
+    else:
+        resized_image = image
+        new_h, new_w = h, w
 
-# Function to preprocess and load the model
-def load_model(model_path, in_features, num_classes):
-    classifier = nn.Linear(in_features, num_classes)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    state_dict = torch.load(model_path, map_location=device)
-    classifier.load_state_dict(state_dict)
-    classifier = classifier.to(device)
-    classifier.eval()
-    return classifier, device
+    delta_w = target_size - new_w
+    delta_h = target_size - new_h
+    top, bottom = delta_h // 2, delta_h - (delta_h // 2)
+    left, right = delta_w // 2, delta_w - (delta_w // 2)
 
-# Function to extract ResNet-50 features
-def extract_resnet_features(image, resnet, device):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    image = transform(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        feature = resnet(image).cpu().numpy().flatten()
-    return feature
+    color = [0, 0, 0]
+    padded_image = cv2.copyMakeBorder(resized_image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return padded_image
 
-# Function to extract LBP features
-def extract_lbp_features(image, num_points=24, radius=8):
-    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray_image = (gray_image * 255).astype(np.uint8)  # Ensure image is of integer dtype
-    lbp = local_binary_pattern(gray_image, num_points, radius, method='uniform')
-    (hist, _) = np.histogram(lbp.ravel(), bins=np.arange(0, num_points + 3), range=(0, num_points + 2))
-    hist = hist.astype("float")
-    hist /= (hist.sum() + 1e-7)
-    return hist
+def sharpen_image(image):
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    sharpened = cv2.filter2D(image, -1, kernel)
+    return sharpened
 
-# Function to predict logo
-def predict_logo(classifier, resnet, scaler, device, label_dict, image_path):
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"Warning: Failed to read image {image_path}")
-        return None
-    image = cv2.resize(image, (TARGET_SIZE, TARGET_SIZE))
-    image = normalize_image(image)
+def smooth_image(image):
+    smoothed = cv2.GaussianBlur(image, (5, 5), 0)
+    return smoothed
 
-    resnet_feature = extract_resnet_features(image, resnet, device)
-    lbp_feature = extract_lbp_features(image)
-    combined_features = np.hstack((resnet_feature, lbp_feature))
-    combined_features = scaler.transform([combined_features])
+def correct_color(image):
+    result = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    lab_planes = list(cv2.split(result))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    lab_planes[0] = clahe.apply(lab_planes[0])
+    result = cv2.merge(tuple(lab_planes))
+    result = cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
+    return result
 
-    inputs = torch.tensor(combined_features, dtype=torch.float32).to(device)
+class LogoClassifierEnsemble(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(LogoClassifierEnsemble, self).__init__()
+        self.fc1 = nn.Linear(2074, 512)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(512, 20)
 
-    with torch.no_grad():
-        outputs = classifier(inputs)
-        _, predicted_class = torch.max(outputs, 1)
+        self.fc3 = nn.Linear(2074, 256)
+        self.fc4 = nn.Linear(256, 20)
 
-    for label, index in label_dict.items():
-        if index == predicted_class.item():
-            return label
-    return None
+    def forward(self, x):
+        x = x.view(x.size(0), -1)  # Flatten the input tensor
+        x1 = self.fc1(x)
+        x1 = self.relu(x1)
+        x1 = self.dropout(x1)
+        x1 = self.fc2(x1)
 
-# Function to predict logos in all images in a folder and calculate accuracy
-def predict_logos_in_folder(classifier, resnet, scaler, device, label_dict, folder_path):
-    brand_accuracy = defaultdict(lambda: {"total": 0, "correct": 0})
-    overall_total = 0
-    overall_correct = 0
+        x2 = self.fc3(x)
+        x2 = self.relu(x2)
+        x2 = self.dropout(x2)
+        x2 = self.fc4(x2)
 
-    for subdir, _, files in os.walk(folder_path):
-        folder_name = os.path.basename(subdir)
-        if folder_name not in label_dict:
-            continue  # Skip folders not in label_dict
-        for filename in files:
-            if filename.endswith(('.jpg', '.jpeg', '.png')):
-                image_path = os.path.join(subdir, filename)
-                predicted_label = predict_logo(classifier, resnet, scaler, device, label_dict, image_path)
-                print(f"Image: {filename}, Predicted logo: {predicted_label}, Actual folder: {folder_name}")
-                brand_accuracy[folder_name]["total"] += 1
-                overall_total += 1
-                if predicted_label == folder_name:
-                    brand_accuracy[folder_name]["correct"] += 1
-                    overall_correct += 1
+        x = (x1 + x2) / 2
+        return x
 
-    for brand, data in brand_accuracy.items():
-        accuracy = (data["correct"] / data["total"]) * 100 if data["total"] > 0 else 0
-        print(f"Brand: {brand}, Total images: {data['total']}, Correct predictions: {data['correct']}, Accuracy: {accuracy:.2f}%")
+class LogoDetectionGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Non-ODL Group 4 - Automated Detection of Logos")
+        self.root.geometry("1600x900")
+        self.create_frames()
+        self.create_buttons()
+        self.model = self.load_model()
+        self.current_image = None
 
-    overall_accuracy = (overall_correct / overall_total) * 100 if overall_total > 0 else 0
-    print(f"\nOverall total images: {overall_total}, Overall correct predictions: {overall_correct}, Overall accuracy: {overall_accuracy:.2f}%")
+    def create_frames(self):
+        self.window1_frame = tk.LabelFrame(self.root, text="Custom Image", width=800, height=600, bd=1, relief="solid")
+        self.window1_frame.place(x=10, y=10)
+        self.window1 = tk.Label(self.window1_frame)
+        self.window1.pack(expand=True)
+
+        self.window2_frame = tk.LabelFrame(self.root, text="Resizing & Padding", width=224, height=224, bd=1,
+                                           relief="solid")
+        self.window2_frame.place(x=10, y=640)
+        self.window2 = tk.Label(self.window2_frame)
+        self.window2.pack(expand=True)
+
+        self.window3_frame = tk.LabelFrame(self.root, text="Color Correction", width=224, height=224, bd=1,
+                                           relief="solid")
+        self.window3_frame.place(x=244, y=640)
+        self.window3 = tk.Label(self.window3_frame)
+        self.window3.pack(expand=True)
+
+        self.window4_frame = tk.LabelFrame(self.root, text="Sharpening", width=224, height=224, bd=1, relief="solid")
+        self.window4_frame.place(x=478, y=640)
+        self.window4 = tk.Label(self.window4_frame)
+        self.window4.pack(expand=True)
+
+        self.window5_frame = tk.LabelFrame(self.root, text="Smoothing", width=224, height=224, bd=1, relief="solid")
+        self.window5_frame.place(x=712, y=640)
+        self.window5 = tk.Label(self.window5_frame)
+        self.window5.pack(expand=True)
+
+        self.logo_detection_result_frame = tk.LabelFrame(self.root, text="Logo Classification", width=224, height=224,
+                                                         bd=1, relief="solid")
+        self.logo_detection_result_frame.place(x=946, y=640)
+        self.logo_detection_result = tk.Label(self.logo_detection_result_frame)
+        self.logo_detection_result.pack(expand=True)
+
+        self.red_hist_frame = tk.LabelFrame(self.root, text="Red Color Histogram", width=300, height=100, bd=1,
+                                            relief="solid")
+        self.red_hist_frame.place(x=820, y=10)
+        self.red_hist = tk.Label(self.red_hist_frame)
+        self.red_hist.pack(expand=True)
+
+        self.green_hist_frame = tk.LabelFrame(self.root, text="Green Color Histogram", width=300, height=100, bd=1,
+                                              relief="solid")
+        self.green_hist_frame.place(x=820, y=260)
+        self.green_hist = tk.Label(self.green_hist_frame)
+        self.green_hist.pack(expand=True)
+
+        self.blue_hist_frame = tk.LabelFrame(self.root, text="Blue Color Histogram", width=300, height=100, bd=1,
+                                             relief="solid")
+        self.blue_hist_frame.place(x=820, y=510)
+        self.blue_hist = tk.Label(self.blue_hist_frame)
+        self.blue_hist.pack(expand=True)
+
+    def create_buttons(self):
+        self.upload_button = tk.Button(self.root, text="Upload Custom Image", command=self.upload_image, width=20)
+        self.upload_button.place(x=10, y=854)
+
+        self.classify_button = tk.Button(self.root, text="Classify Logo", command=self.classify_logo, width=20)
+        self.classify_button.place(x=780, y=854)
+
+        self.exit_button = tk.Button(self.root, text="Exit", command=self.root.quit, width=20)
+        self.exit_button.place(x=1000, y=854)
+
+    def load_model(self):
+        model = LogoClassifierEnsemble(input_dim=2074, output_dim=20)
+        state_dict = torch.load("/mnt/data/logodetection.pth", map_location=torch.device('cpu'))
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+        return model
+
+    def upload_image(self):
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            image = Image.open(file_path)
+            original_width, original_height = image.size
+            if image.width > 800 or image.height > 600:
+                image = image.resize((800, 600), Image.Resampling.LANCZOS)
+            else:
+                image = ImageOps.pad(image, (800, 600), method=Image.Resampling.LANCZOS, color=(255, 255, 255))
+            self.current_image = image.copy()  # Make a copy to keep the original image unchanged
+            self.display_image_with_roi(image, self.window1, file_path, original_width, original_height)
+
+    def display_image_with_roi(self, image, window, file_path, original_width, original_height):
+        modified_image, rois = self.draw_roi_on_image(file_path, image, original_width, original_height)
+        image_tk = ImageTk.PhotoImage(modified_image)
+        window.config(image=image_tk)
+        window.image = image_tk
+
+        for roi in rois:
+            self.process_and_display_roi(roi)
+
+    def draw_roi_on_image(self, file_path, image, original_width, original_height):
+        client = vision.ImageAnnotatorClient()
+        with open(file_path, "rb") as image_file:
+            content = image_file.read()
+        image_annotator = vision.Image(content=content)
+        response = client.logo_detection(image=image_annotator)
+        logos = response.logo_annotations
+
+        draw = ImageDraw.Draw(image)
+        rois = []
+        for logo in logos:
+            vertices = [(vertex.x * 800 / original_width, vertex.y * 600 / original_height) for vertex in
+                        logo.bounding_poly.vertices]
+            if len(vertices) == 4:
+                draw.rectangle([vertices[0], vertices[2]], outline="yellow", width=3)
+                roi_box = (vertices[0][0] + 3, vertices[0][1] + 3, vertices[2][0] - 3, vertices[2][1] - 3)
+                roi = image.crop(roi_box)
+                rois.append((roi, roi_box))
+
+        if response.error.message:
+            raise Exception(f"{response.error.message}")
+
+        return image, rois
+
+    def process_and_display_roi(self, roi_data):
+        roi, roi_box = roi_data
+
+        # Convert PIL image to OpenCV format
+        roi_cv2 = cv2.cvtColor(np.array(roi), cv2.COLOR_RGB2BGR)
+
+        # Resize and pad ROI
+        resized_padded_roi = resize_and_pad_image(roi_cv2)
+        self.display_processed_image(resized_padded_roi, self.window2)
+
+        # Color correction
+        color_corrected_roi = correct_color(resized_padded_roi)
+        self.display_processed_image(color_corrected_roi, self.window3)
+
+        # Sharpen the resized and padded ROI
+        sharpened_roi = sharpen_image(color_corrected_roi)
+        self.display_processed_image(sharpened_roi, self.window4)
+
+        # Smooth the sharpened ROI
+        smoothed_roi = smooth_image(sharpened_roi)
+        self.display_processed_image(smoothed_roi, self.window5)
+
+        # Classify the smoothed ROI
+        self.classify_logo_from_image(smoothed_roi)
+
+    def display_processed_image(self, image, window):
+        image_tk = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
+        window.config(image=image_tk)
+        window.image = image_tk
+
+    def classify_logo_from_image(self, image):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Ensure image is in RGB format
+        image = Image.fromarray(image)  # Convert OpenCV image back to PIL format
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),  # Resize the image to 224x224
+            transforms.ToTensor(),  # Convert the image to a tensor
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize the tensor
+        ])
+        image = transform(image)
+        image = image.unsqueeze(0)  # Add batch dimension
+        with torch.no_grad():
+            output = self.model(image)
+            _, predicted = torch.max(output, 1)
+            self.logo_detection_result.config(text=f"Detected Logo: {predicted.item()}")
+
+    def classify_logo(self):
+        if self.current_image is not None:
+            features = self.extract_features(self.current_image)
+            output = self.model(features)
+            _, predicted = torch.max(output, 1)
+            self.logo_detection_result.config(text=f"Detected Logo: {predicted.item()}")
+        else:
+            self.logo_detection_result.config(text="No image uploaded.")
+
+    def extract_features(self, image):
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize the tensor
+        ])
+        image = transform(image)
+        image = image.unsqueeze(0)  # Add batch dimension
+        return image
 
 if __name__ == "__main__":
-    model_path = 'classifier_logo_detection.pth'  # Path to your saved model
-    label_dict_path = 'label_dict.pkl'  # Path to your saved label dictionary
-    scaler_path = 'scaler.pkl'  # Path to your saved scaler
-    folder_path = 'dataset/test'  # Path to the folder containing images to predict
-
-    # Load the label dictionary and scaler
-    label_dict = joblib.load(label_dict_path)
-    scaler = joblib.load(scaler_path)
-
-    # Determine the number of input features for the classifier
-    dummy_image_path = None
-    for subdir, _, files in os.walk(folder_path):
-        for filename in files:
-            if filename.endswith(('.jpg', '.jpeg', '.png')):
-                dummy_image_path = os.path.join(subdir, filename)
-                break
-        if dummy_image_path:
-            break
-
-    if not dummy_image_path:
-        raise FileNotFoundError("No images found in the provided folder path.")
-
-    dummy_image = cv2.imread(dummy_image_path)
-    dummy_image = cv2.resize(dummy_image, (TARGET_SIZE, TARGET_SIZE))
-    dummy_image = normalize_image(dummy_image)
-    resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-    resnet = nn.Sequential(*list(resnet.children())[:-1])  # Remove the last layer
-    resnet = resnet.eval()
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    resnet = resnet.to(device)
-    resnet_feature = extract_resnet_features(dummy_image, resnet, device)
-    lbp_feature = extract_lbp_features(dummy_image)
-    combined_features = np.hstack((resnet_feature, lbp_feature))
-    in_features = combined_features.shape[0]
-
-    # Load the classifier model and device
-    classifier, device = load_model(model_path, in_features, len(label_dict))
-
-    # Load the ResNet-50 model for feature extraction
-    resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-    resnet = nn.Sequential(*list(resnet.children())[:-1])  # Remove the last layer
-    resnet = resnet.to(device)
-    resnet.eval()
-
-    # Predict logos in all images in the specified folder and calculate accuracy
-    predict_logos_in_folder(classifier, resnet, scaler, device, label_dict, folder_path)
+    root = tk.Tk()
+    app = LogoDetectionGUI(root)
+    root.mainloop()

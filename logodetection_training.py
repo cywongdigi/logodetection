@@ -76,8 +76,8 @@ def preprocess_images(input_dir, output_dir):
                 if (image is None):
                     print(f"[WARNING] Failed to read image {image_path}")
                     continue
-                image = color_correction(image)
                 image = resize_and_pad_image(image)
+                image = color_correction(image)
                 image = sharpen_image(image)
                 image = smooth_image(image)
                 image = normalize_image(image)
@@ -164,16 +164,17 @@ class CustomDataset(Dataset):
 class LogoClassifierEnsemble(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(LogoClassifierEnsemble, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 512)
+        self.fc1 = nn.Linear(2074, 512)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.5)
-        self.fc2 = nn.Linear(512, output_dim)
+        self.fc2 = nn.Linear(512, 20)  # Changed from output_dim to 20
 
         # Additional models for ensemble
-        self.fc3 = nn.Linear(input_dim, 256)
-        self.fc4 = nn.Linear(256, output_dim)
+        self.fc3 = nn.Linear(2074, 256)  # Changed from input_dim to 2074
+        self.fc4 = nn.Linear(256, 20)
 
     def forward(self, x):
+        x = x.view(x.size(0), -1)  # Flatten the input tensor
         x1 = self.fc1(x)
         x1 = self.relu(x1)
         x1 = self.dropout(x1)
