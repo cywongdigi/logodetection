@@ -21,7 +21,11 @@ import time
 TARGET_SIZE = 224
 
 def normalize_image(image):
-    return image.astype(np.float32) / 255.0
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    return transform(image).unsqueeze(0)
 
 def color_correction(image):
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
@@ -86,10 +90,12 @@ def preprocess_images(input_dir, output_dir):
                 if (not os.path.exists(output_subdir)):
                     os.makedirs(output_subdir)
                 output_path = os.path.join(output_subdir, filename)
+                image = image.squeeze(0).permute(1, 2, 0).numpy()  # Convert tensor back to NumPy array
                 cv2.imwrite(output_path, (image * 255).astype(np.uint8))
 
 def extract_lbp_features(image, num_points=24, radius=8):
     gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray_image = gray_image.astype(np.uint8)  # Convert to integer type
     lbp = local_binary_pattern(gray_image, num_points, radius, method='uniform')
     (hist, _) = np.histogram(lbp.ravel(), bins=np.arange(0, num_points + 3), range=(0, num_points + 2))
     hist = hist.astype("float")
@@ -112,7 +118,7 @@ def load_images_with_lbp(directory):
                     print(f"[WARNING] Failed to read image {image_path}")
                     continue
                 image = cv2.resize(image, (TARGET_SIZE, TARGET_SIZE))
-                normalized_image = normalize_image(image)
+                normalized_image = normalize_image(image).squeeze(0).permute(1, 2, 0).numpy()  # Convert tensor back to NumPy array
                 images.append(normalized_image)
                 lbp = extract_lbp_features(image)
                 lbp_features.append(lbp)
@@ -225,6 +231,9 @@ def balance_classes(images, lbp_features, labels, file_paths, batch_size=100):
                 print(f"[WARNING] Skipping batch {i} due to insufficient samples: {e}.")
         else:
             print(f"[WARNING] Skipping batch {i} due to only one class present.")
+
+    if len(balanced_features) == 0:
+        raise ValueError("[ERROR] No batches could be resampled. Check your dataset and batch sizes.")
 
     # Concatenate all balanced features and labels
     balanced_features = np.vstack(balanced_features)
