@@ -63,8 +63,13 @@ def smooth_image(image):
     return smoothed
 
 
+# This should be consistent in both scripts
 def normalize_image(image):
-    return image.astype(np.float32) / 255.0
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    return transform(image).unsqueeze(0)
 
 
 def extract_lbp_features(image, num_points=24, radius=8):
@@ -193,6 +198,9 @@ class LogoDetectionGUI:
         return joblib.load("label_dict.pkl")  # Load the label dictionary from the file
 
     def extract_features(self, image):
+        # Normalize the image
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray((image * 255).astype(np.uint8))
         transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -217,11 +225,10 @@ class LogoDetectionGUI:
             else:
                 image = ImageOps.pad(image, (800, 600), method=Image.Resampling.LANCZOS, color=(255, 255, 255))
             self.current_image = image.copy()  # Make a copy to keep the original image unchanged
-            normalized_image = normalize_image(np.array(image))
+            normalized_image = np.array(image).astype(np.float32) / 255.0  # Scale to [0, 1]
             self.display_image_with_roi(image, self.window1, file_path, original_width, original_height)
             self.display_histograms(image)  # Display histograms
-            pil_image = Image.fromarray((normalized_image * 255).astype(np.uint8))  # Convert back to PIL image
-            self.classify_logo(pil_image)  # Automatically classify logo after uploading the image
+            self.classify_logo(normalized_image)  # Automatically classify logo after uploading the image
 
     def display_image_with_roi(self, image, window, file_path, original_width, original_height):
         modified_image, rois = self.draw_roi_on_image(file_path, image, original_width, original_height)
@@ -314,6 +321,8 @@ class LogoDetectionGUI:
             self.logo_detection_result.config(text=f"{brand_label}")
 
     def display_histograms(self, image):
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         r, g, b = image.split()
         fig, axs = plt.subplots(3, 1, figsize=(4, 6))  # Adjust the figure size to 400x600
 
