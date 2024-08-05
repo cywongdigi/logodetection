@@ -9,10 +9,16 @@ import os
 import cv2
 import numpy as np
 import torch.nn.functional as F
+from torchvision import models
+from skimage.feature import local_binary_pattern
+import joblib  # For loading the label dictionary
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "genuine-vent-430507-b0-5293ed9cf15e.json"
 
 TARGET_SIZE = 224
+
 
 def resize_and_pad_image(image, target_size=TARGET_SIZE):
     h, w, _ = image.shape
@@ -33,16 +39,6 @@ def resize_and_pad_image(image, target_size=TARGET_SIZE):
     padded_image = cv2.copyMakeBorder(resized_image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
     return padded_image
 
-def sharpen_image(image):
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
-    sharpened = cv2.filter2D(image, -1, kernel)
-    return sharpened
-
-def smooth_image(image):
-    smoothed = cv2.GaussianBlur(image, (5, 5), 0)
-    return smoothed
 
 def correct_color(image):
     result = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
@@ -52,6 +48,42 @@ def correct_color(image):
     result = cv2.merge(tuple(lab_planes))
     result = cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
     return result
+
+
+def sharpen_image(image):
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    sharpened = cv2.filter2D(image, -1, kernel)
+    return sharpened
+
+
+def smooth_image(image):
+    smoothed = cv2.GaussianBlur(image, (5, 5), 0)
+    return smoothed
+
+
+def normalize_image(image):
+    return image.astype(np.float32) / 255.0
+
+
+def extract_lbp_features(image, num_points=24, radius=8):
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    lbp = local_binary_pattern(gray_image, num_points, radius, method='uniform')
+    (hist, _) = np.histogram(lbp.ravel(), bins=np.arange(0, num_points + 3), range=(0, num_points + 2))
+    hist = hist.astype("float")
+    hist /= (hist.sum() + 1e-7)
+    return hist
+
+
+def extract_resnet_features(image, resnet, device):
+    resnet.eval()
+    resnet = resnet.to(device)
+    image = image.to(device).float()
+    with torch.no_grad():
+        feature = resnet(image).cpu().numpy().flatten()
+    return feature
+
 
 class LogoClassifierEnsemble(nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -79,84 +111,101 @@ class LogoClassifierEnsemble(nn.Module):
         x = (x1 + x2) / 2
         return x
 
+
 class LogoDetectionGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Non-ODL Group 4 - Automated Detection of Logos")
-        self.root.geometry("1600x900")
+        self.root.geometry("1184x926")
         self.create_frames()
         self.create_buttons()
         self.model = self.load_model()
+        self.feature_extractor = self.load_feature_extractor()
+        self.label_dict = self.load_label_dict()  # Load the label dictionary
+        self.inverted_label_dict = {v: k for k, v in self.label_dict.items()}  # Invert the dictionary
         self.current_image = None
 
     def create_frames(self):
-        self.window1_frame = tk.LabelFrame(self.root, text="Custom Image", width=800, height=600, bd=1, relief="solid")
+        self.window1_frame = tk.LabelFrame(self.root, text="Custom Image", width=802, height=618, bd=1, relief="solid")
         self.window1_frame.place(x=10, y=10)
+        self.window1_frame.pack_propagate(False)  # Prevent the frame from resizing to fit the child widget
         self.window1 = tk.Label(self.window1_frame)
-        self.window1.pack(expand=True)
+        self.window1.place(x=0, y=0, width=800, height=600)  # Ensure the label fills the entire frame
 
-        self.window2_frame = tk.LabelFrame(self.root, text="Resizing & Padding", width=224, height=224, bd=1,
-                                           relief="solid")
-        self.window2_frame.place(x=10, y=640)
+        self.window2_frame = tk.LabelFrame(self.root, text="Resizing & Padding", width=226, height=242, bd=1, relief="solid")
+        self.window2_frame.place(x=10, y=638)
+        self.window2_frame.pack_propagate(False)  # Prevent the frame from resizing to fit the child widget
         self.window2 = tk.Label(self.window2_frame)
-        self.window2.pack(expand=True)
+        self.window2.place(x=0, y=0, width=224, height=224)  # Ensure the label fills the entire frame
 
-        self.window3_frame = tk.LabelFrame(self.root, text="Color Correction", width=224, height=224, bd=1,
-                                           relief="solid")
-        self.window3_frame.place(x=244, y=640)
+        self.window3_frame = tk.LabelFrame(self.root, text="Color Correction", width=226, height=242, bd=1, relief="solid")
+        self.window3_frame.place(x=246, y=638)
+        self.window3_frame.pack_propagate(False)  # Prevent the frame from resizing to fit the child widget
         self.window3 = tk.Label(self.window3_frame)
-        self.window3.pack(expand=True)
+        self.window3.place(x=0, y=0, width=224, height=224)  # Ensure the label fills the entire frame
 
-        self.window4_frame = tk.LabelFrame(self.root, text="Sharpening", width=224, height=224, bd=1, relief="solid")
-        self.window4_frame.place(x=478, y=640)
+        self.window4_frame = tk.LabelFrame(self.root, text="Sharpening", width=226, height=242, bd=1, relief="solid")
+        self.window4_frame.place(x=480, y=638)
+        self.window4_frame.pack_propagate(False)  # Prevent the frame from resizing to fit the child widget
         self.window4 = tk.Label(self.window4_frame)
-        self.window4.pack(expand=True)
+        self.window4.place(x=0, y=0, width=224, height=224)  # Ensure the label fills the entire frame
 
-        self.window5_frame = tk.LabelFrame(self.root, text="Smoothing", width=224, height=224, bd=1, relief="solid")
-        self.window5_frame.place(x=712, y=640)
+        self.window5_frame = tk.LabelFrame(self.root, text="Smoothing", width=226, height=242, bd=1, relief="solid")
+        self.window5_frame.place(x=714, y=638)
+        self.window5_frame.pack_propagate(False)  # Prevent the frame from resizing to fit the child widget
         self.window5 = tk.Label(self.window5_frame)
-        self.window5.pack(expand=True)
+        self.window5.place(x=0, y=0, width=224, height=224)  # Ensure the label fills the entire frame
 
-        self.logo_detection_result_frame = tk.LabelFrame(self.root, text="Logo Classification", width=224, height=224,
-                                                         bd=1, relief="solid")
-        self.logo_detection_result_frame.place(x=946, y=640)
-        self.logo_detection_result = tk.Label(self.logo_detection_result_frame)
-        self.logo_detection_result.pack(expand=True)
+        self.logo_detection_result_frame = tk.LabelFrame(self.root, text="Logo Classification", width=226, height=242, bd=1, relief="solid")
+        self.logo_detection_result_frame.place(x=948, y=638)
+        self.logo_detection_result_frame.pack_propagate(False)  # Prevent the frame from resizing to fit the child widget
+        self.logo_detection_result = tk.Label(self.logo_detection_result_frame, font=("Arial", 18))
+        self.logo_detection_result.place(x=0, y=0, width=224, height=224)  # Ensure the label fills the entire frame
 
-        self.red_hist_frame = tk.LabelFrame(self.root, text="Red Color Histogram", width=300, height=100, bd=1,
-                                            relief="solid")
-        self.red_hist_frame.place(x=820, y=10)
-        self.red_hist = tk.Label(self.red_hist_frame)
-        self.red_hist.pack(expand=True)
-
-        self.green_hist_frame = tk.LabelFrame(self.root, text="Green Color Histogram", width=300, height=100, bd=1,
-                                              relief="solid")
-        self.green_hist_frame.place(x=820, y=260)
-        self.green_hist = tk.Label(self.green_hist_frame)
-        self.green_hist.pack(expand=True)
-
-        self.blue_hist_frame = tk.LabelFrame(self.root, text="Blue Color Histogram", width=300, height=100, bd=1,
-                                             relief="solid")
-        self.blue_hist_frame.place(x=820, y=510)
-        self.blue_hist = tk.Label(self.blue_hist_frame)
-        self.blue_hist.pack(expand=True)
+        self.rgb_hist_frame = tk.LabelFrame(self.root, text="RGB Histogram", width=352, height=618, bd=1, relief="solid")
+        self.rgb_hist_frame.place(x=822, y=10)
+        self.rgb_hist_frame.pack_propagate(False)  # Prevent the frame from resizing to fit the child widget
 
     def create_buttons(self):
         self.upload_button = tk.Button(self.root, text="Upload Custom Image", command=self.upload_image, width=20)
-        self.upload_button.place(x=10, y=854)
+        self.upload_button.place(x=10, y=890)
 
         self.classify_button = tk.Button(self.root, text="Classify Logo", command=self.classify_logo, width=20)
-        self.classify_button.place(x=780, y=854)
+        self.classify_button.place(x=480, y=890)
 
         self.exit_button = tk.Button(self.root, text="Exit", command=self.root.quit, width=20)
-        self.exit_button.place(x=1000, y=854)
+        self.exit_button.place(x=948, y=890)
 
     def load_model(self):
         model = LogoClassifierEnsemble(input_dim=2074, output_dim=20)
-        state_dict = torch.load("/mnt/data/logodetection.pth", map_location=torch.device('cpu'))
+        state_dict = torch.load("logodetection.pth", map_location=torch.device('cpu'))
         model.load_state_dict(state_dict, strict=False)
         model.eval()
         return model
+
+    def load_feature_extractor(self):
+        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        resnet = nn.Sequential(*list(resnet.children())[:-1])  # Remove the final classification layer
+        resnet.eval()
+        return resnet
+
+    def load_label_dict(self):
+        return joblib.load("label_dict.pkl")  # Load the label dictionary from the file
+
+    def extract_features(self, image):
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        image = transform(image).unsqueeze(0)  # Add batch dimension
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        resnet_features = extract_resnet_features(image, self.feature_extractor, device)
+        lbp_features = extract_lbp_features(cv2.cvtColor(np.array(image.squeeze().permute(1, 2, 0)), cv2.COLOR_RGB2BGR))
+        lbp_features = lbp_features.reshape(-1)  # Ensure LBP features have 1 dimension
+        combined_features = np.hstack((resnet_features, lbp_features))
+        combined_features = torch.tensor(combined_features).float().unsqueeze(0)  # Add batch dimension
+        return combined_features
 
     def upload_image(self):
         file_path = filedialog.askopenfilename()
@@ -168,7 +217,11 @@ class LogoDetectionGUI:
             else:
                 image = ImageOps.pad(image, (800, 600), method=Image.Resampling.LANCZOS, color=(255, 255, 255))
             self.current_image = image.copy()  # Make a copy to keep the original image unchanged
+            normalized_image = normalize_image(np.array(image))
             self.display_image_with_roi(image, self.window1, file_path, original_width, original_height)
+            self.display_histograms(image)  # Display histograms
+            pil_image = Image.fromarray((normalized_image * 255).astype(np.uint8))  # Convert back to PIL image
+            self.classify_logo(pil_image)  # Automatically classify logo after uploading the image
 
     def display_image_with_roi(self, image, window, file_path, original_width, original_height):
         modified_image, rois = self.draw_roi_on_image(file_path, image, original_width, original_height)
@@ -236,36 +289,50 @@ class LogoDetectionGUI:
     def classify_logo_from_image(self, image):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Ensure image is in RGB format
         image = Image.fromarray(image)  # Convert OpenCV image back to PIL format
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),  # Resize the image to 224x224
-            transforms.ToTensor(),  # Convert the image to a tensor
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize the tensor
-        ])
-        image = transform(image)
-        image = image.unsqueeze(0)  # Add batch dimension
+        features = self.extract_features(image)
         with torch.no_grad():
-            output = self.model(image)
-            _, predicted = torch.max(output, 1)
-            self.logo_detection_result.config(text=f"Detected Logo: {predicted.item()}")
-
-    def classify_logo(self):
-        if self.current_image is not None:
-            features = self.extract_features(self.current_image)
             output = self.model(features)
             _, predicted = torch.max(output, 1)
-            self.logo_detection_result.config(text=f"Detected Logo: {predicted.item()}")
-        else:
-            self.logo_detection_result.config(text="No image uploaded.")
+            predicted_index = predicted.item()  # Get the predicted index
+            brand_label = self.inverted_label_dict.get(predicted_index, "Unknown")  # Get the brand label
+            self.logo_detection_result.config(text=f"{brand_label}")
 
-    def extract_features(self, image):
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize the tensor
-        ])
-        image = transform(image)
-        image = image.unsqueeze(0)  # Add batch dimension
-        return image
+    def classify_logo(self, image=None):  # Accept an optional image parameter
+        if image is None:
+            if self.current_image is not None:
+                image = self.current_image
+            else:
+                self.logo_detection_result.config(text="No image uploaded.")
+                return
+
+        features = self.extract_features(image)
+        with torch.no_grad():
+            output = self.model(features)
+            _, predicted = torch.max(output, 1)
+            predicted_index = predicted.item()  # Get the predicted index
+            brand_label = self.inverted_label_dict.get(predicted_index, "Unknown")  # Get the brand label
+            self.logo_detection_result.config(text=f"{brand_label}")
+
+    def display_histograms(self, image):
+        r, g, b = image.split()
+        fig, axs = plt.subplots(3, 1, figsize=(4, 6))  # Adjust the figure size to 400x600
+
+        for ax, channel, color in zip(axs, [r, g, b], ['red', 'green', 'blue']):
+            hist = channel.histogram()
+            ax.bar(range(256), hist, color=color)
+            ax.set_xlim(0, 255)
+            ax.set_ylim(0, max(hist))
+            ax.set_title(f'{color.capitalize()} Color Histogram', fontsize=10)  # Set the title font size
+
+        plt.tight_layout()
+
+        # Ensure the frame does not resize based on the content
+        self.rgb_hist_frame.pack_propagate(False)
+
+        canvas = FigureCanvasTkAgg(fig, master=self.rgb_hist_frame)
+        canvas.get_tk_widget().pack(expand=True, fill='both')
+        canvas.draw()
+
 
 if __name__ == "__main__":
     root = tk.Tk()

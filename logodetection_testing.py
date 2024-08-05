@@ -80,6 +80,7 @@ class LogoClassifierEnsemble(nn.Module):
         self.fc4 = nn.Linear(256, output_dim)
 
     def forward(self, x):
+        x = x.view(x.size(0), -1)  # Flatten the input tensor
         x1 = self.fc1(x)
         x1 = self.relu(x1)
         x1 = self.dropout(x1)
