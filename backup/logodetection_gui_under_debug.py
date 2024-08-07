@@ -8,7 +8,6 @@ from google.cloud import vision
 import os
 import cv2
 import numpy as np
-import torch.nn.functional as F
 from torchvision import models
 from skimage.feature import local_binary_pattern
 import joblib  # For loading the label dictionary
@@ -18,6 +17,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "genuine-vent-430507-b0-5293ed9cf15e.json"
 
 TARGET_SIZE = 224
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def resize_and_pad_image(image, target_size=TARGET_SIZE):
@@ -40,14 +42,14 @@ def resize_and_pad_image(image, target_size=TARGET_SIZE):
     return padded_image
 
 
-def correct_color(image):
-    result = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    lab_planes = list(cv2.split(result))
+def color_correction(image):
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    lab_planes[0] = clahe.apply(lab_planes[0])
-    result = cv2.merge(tuple(lab_planes))
-    result = cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
-    return result
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    corrected_image = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    return corrected_image
 
 
 def sharpen_image(image):
@@ -63,60 +65,14 @@ def smooth_image(image):
     return smoothed
 
 
-# This should be consistent in both scripts
-def normalize_image(image):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    return transform(image).unsqueeze(0)
-
-
 def extract_lbp_features(image, num_points=24, radius=8):
-    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if gray_image.dtype != np.uint8:
-        gray_image = (gray_image * 255).astype(np.uint8)  # Convert to uint8 if not already
+    gray_image = cv2.cvtColor(cv2.convertScaleAbs(image), cv2.COLOR_BGR2GRAY)
+    gray_image = gray_image.astype(np.uint8)  # Convert to integer type
     lbp = local_binary_pattern(gray_image, num_points, radius, method='uniform')
     (hist, _) = np.histogram(lbp.ravel(), bins=np.arange(0, num_points + 3), range=(0, num_points + 2))
     hist = hist.astype("float")
     hist /= (hist.sum() + 1e-7)
     return hist
-
-
-def extract_resnet_features(image, resnet, device):
-    resnet.eval()
-    resnet = resnet.to(device)
-    image = image.to(device).float()
-    with torch.no_grad():
-        feature = resnet(image).cpu().numpy().flatten()
-    return feature
-
-
-class LogoClassifierEnsemble(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(LogoClassifierEnsemble, self).__init__()
-        self.fc1 = nn.Linear(2074, 512)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.5)
-        self.fc2 = nn.Linear(512, 20)
-
-        self.fc3 = nn.Linear(2074, 256)
-        self.fc4 = nn.Linear(256, 20)
-
-    def forward(self, x):
-        x = x.view(x.size(0), -1)  # Flatten the input tensor
-        x1 = self.fc1(x)
-        x1 = self.relu(x1)
-        x1 = self.dropout(x1)
-        x1 = self.fc2(x1)
-
-        x2 = self.fc3(x)
-        x2 = self.relu(x2)
-        x2 = self.dropout(x2)
-        x2 = self.fc4(x2)
-
-        x = (x1 + x2) / 2
-        return x
 
 
 class LogoDetectionGUI:
@@ -129,9 +85,10 @@ class LogoDetectionGUI:
         self.model = self.load_model()
         self.feature_extractor = self.load_feature_extractor()
         self.label_dict = self.load_label_dict()  # Load the label dictionary
-        self.scaler = self.load_scaler()  # Load the scaler
+        # self.scaler = self.load_scaler()  # Load the scaler
         self.inverted_label_dict = {v: k for k, v in self.label_dict.items()}  # Invert the dictionary
         self.current_image = None
+        self.smoothed_roi = None  # Initialize smoothed ROI
 
     def create_frames(self):
         self.window1_frame = tk.LabelFrame(self.root, text="Custom Image", width=802, height=618, bd=1, relief="solid")
@@ -178,18 +135,33 @@ class LogoDetectionGUI:
         self.upload_button = tk.Button(self.root, text="Upload Custom Image", command=self.upload_image, width=20)
         self.upload_button.place(x=10, y=890)
 
-        self.classify_button = tk.Button(self.root, text="Classify Logo", command=self.classify_logo, width=20)
-        self.classify_button.place(x=480, y=890)
+        self.classify_roi_button = tk.Button(self.root, text="Classify ROI", command=lambda: self.classify_logo_from_image(self.smoothed_roi), width=20)
+        self.classify_roi_button.place(x=246, y=890)
+
+        self.classify_full_image_button = tk.Button(self.root, text="Classify Full Image", command=self.classify_full_image, width=20)
+        self.classify_full_image_button.place(x=480, y=890)
 
         self.exit_button = tk.Button(self.root, text="Exit", command=self.root.quit, width=20)
         self.exit_button.place(x=948, y=890)
 
     def load_model(self):
-        model = LogoClassifierEnsemble(input_dim=2074, output_dim=20)
-        state_dict = torch.load("logodetection.pth", map_location=torch.device('cpu'), weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
-        model.eval()
-        return model
+        resnet_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        num_ftrs = resnet_model.fc.in_features
+        resnet_model.fc = nn.Identity()  # Remove the fully connected layer
+
+        self.resnet_model = resnet_model.to(device)  # Separate ResNet model
+
+        custom_model = nn.Sequential(
+            nn.Linear(num_ftrs + 26, 100),  # Combine ResNet features with LBP
+            nn.ReLU(),
+            nn.Linear(100, 21)  # Adjust the output layer to match the number of classes
+        )
+
+        state_dict = torch.load("model/resnet50_lbp/resnet50_lbp_model.pth", map_location=torch.device('cpu'))
+        custom_model.load_state_dict(state_dict, strict=False)
+        custom_model = custom_model.to(device)
+        custom_model.eval()
+        return custom_model
 
     def load_feature_extractor(self):
         resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
@@ -198,33 +170,57 @@ class LogoDetectionGUI:
         return resnet
 
     def load_label_dict(self):
-        label_dict = joblib.load("label_dict.pkl")  # Load the label dictionary from the file
-        for index, label in label_dict.items():
-            print(f"Index: {index}, Label: {label}")  # Print all the labels and their indices
+        label_dict = joblib.load("model/resnet50_lbp/resnet50_lbp_label_dict.pkl")  # Load the label dictionary from the file
+        label_dict = {k: v for k, v in label_dict.items() if k != 'preprocessed_dataset' and v != 0}
+        # for index, label in label_dict.items():
+        #     print(f"Index: {index}, Label: {label}")  # Print all the labels and their indices
         return label_dict
 
     def load_scaler(self):
-        return joblib.load("scaler.pkl")  # Load the scaler from the file
+        scaler = joblib.load("model/resnet50_lbp/resnet50_lbp_scaler.pkl")  # Ensure correct file path
+        if isinstance(scaler, dict):
+            raise TypeError("The loaded scaler is a dictionary, not a scaler object. Please check the file contents.")
+        return scaler
 
     def extract_features(self, image):
-        # Normalize the image
+        # Normalize the image for ResNet
         if isinstance(image, np.ndarray):
-            image = Image.fromarray((image * 255).astype(np.uint8))
+            image = Image.fromarray(image)  # Ensure the image is in the correct format
         transform = transforms.Compose([
-            transforms.Resize((224, 224)),
+            # transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        image = transform(image).unsqueeze(0)  # Add batch dimension
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        resnet_features = extract_resnet_features(image, self.feature_extractor, device)
-        lbp_features = extract_lbp_features(cv2.cvtColor(np.array(image.squeeze().permute(1, 2, 0)), cv2.COLOR_RGB2BGR))
-        lbp_features = lbp_features.reshape(-1)  # Ensure LBP features have 1 dimension
+        # Apply the transform to the image
+        image_tensor = transform(image).unsqueeze(0).to(device)
+
+        # Extract ResNet features
+        with torch.no_grad():
+            resnet_features = self.feature_extractor(image_tensor).cpu().numpy().flatten()
+
+        # Convert the image back to NumPy array for LBP feature extraction
+        image_cv2 = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+        # Extract LBP features
+        lbp_features = extract_lbp_features(image_cv2).reshape(-1)
+
+        # Combine features
         combined_features = np.hstack((resnet_features, lbp_features))
 
+        # Print the number of features for debugging
+        # print(f"ResNet Features Shape: {resnet_features.shape}")
+        # print(f"LBP Features Shape: {lbp_features.shape}")
+        # print(f"Combined Features Shape: {combined_features.shape}")
+
+        # # Check if the number of features matches what the scaler expects
+        # expected_features = self.scaler.n_features_in_
+        # if combined_features.shape[0] != expected_features:
+        #     raise ValueError(
+        #         f"Feature mismatch: Extracted {combined_features.shape[0]} features, but the scaler expects {expected_features} features.")
+
         # Apply the scaler to the combined features
-        combined_features = self.scaler.transform([combined_features]).astype(np.float32)
-        combined_features = torch.tensor(combined_features).float().unsqueeze(0)  # Add batch dimension
+        # combined_features = self.scaler.transform([combined_features]).astype(np.float32)
+        combined_features = torch.tensor(combined_features).float().unsqueeze(0)
         return combined_features
 
     def upload_image(self):
@@ -237,10 +233,8 @@ class LogoDetectionGUI:
             else:
                 image = ImageOps.pad(image, (800, 600), method=Image.Resampling.LANCZOS, color=(255, 255, 255))
             self.current_image = image.copy()  # Make a copy to keep the original image unchanged
-            normalized_image = np.array(image).astype(np.float32) / 255.0  # Scale to [0, 1]
             self.display_image_with_roi(image, self.window1, file_path, original_width, original_height)
             self.display_histograms(image)  # Display histograms
-            # self.classify_logo(normalized_image)  # Automatically classify logo after uploading the image
 
     def display_image_with_roi(self, image, window, file_path, original_width, original_height):
         modified_image, rois = self.draw_roi_on_image(file_path, image, original_width, original_height)
@@ -286,7 +280,7 @@ class LogoDetectionGUI:
         self.display_processed_image(resized_padded_roi, self.window2)
 
         # Color correction
-        color_corrected_roi = correct_color(resized_padded_roi)
+        color_corrected_roi = color_correction(resized_padded_roi)
         self.display_processed_image(color_corrected_roi, self.window3)
 
         # Sharpen the resized and padded ROI
@@ -294,11 +288,11 @@ class LogoDetectionGUI:
         self.display_processed_image(sharpened_roi, self.window4)
 
         # Smooth the sharpened ROI
-        smoothed_roi = smooth_image(sharpened_roi)
-        self.display_processed_image(smoothed_roi, self.window5)
+        self.smoothed_roi = smooth_image(sharpened_roi)
+        self.display_processed_image(self.smoothed_roi, self.window5)
 
         # Classify the smoothed ROI
-        self.classify_logo_from_image(smoothed_roi)
+        self.classify_logo_from_image(self.smoothed_roi)
 
     def display_processed_image(self, image, window):
         image_tk = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
@@ -314,10 +308,10 @@ class LogoDetectionGUI:
             _, predicted = torch.max(output, 1)
             predicted_index = predicted.item()  # Get the predicted index
             brand_label = self.inverted_label_dict.get(predicted_index, "Unknown")  # Get the brand label
-            print(f"From Image: Predicted Index: {predicted_index}, Predicted Label: {brand_label}")  # Print the index and label
+            print(f"ROI Predicted Index: {predicted_index}, Predicted Label: {brand_label}")  # Print the index and label
             self.logo_detection_result.config(text=f"{brand_label}")
 
-    def classify_logo(self, image=None):  # Accept an optional image parameter
+    def classify_full_image(self, image=None):  # Accept an optional image parameter
         if image is None:
             if self.current_image is not None:
                 image = self.current_image
@@ -331,7 +325,7 @@ class LogoDetectionGUI:
             _, predicted = torch.max(output, 1)
             predicted_index = predicted.item()  # Get the predicted index
             brand_label = self.inverted_label_dict.get(predicted_index, "Unknown")  # Get the brand label
-            print(f"No Image Predicted Index: {predicted_index}, Predicted Label: {brand_label}")  # Print the index and label
+            print(f"Full Image Predicted Index: {predicted_index}, Predicted Label: {brand_label}")  # Print the index and label
             self.logo_detection_result.config(text=f"{brand_label}")
 
     def display_histograms(self, image):
