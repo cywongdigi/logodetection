@@ -170,8 +170,8 @@ class LogoDetectionGUI:
         self.upload_button = tk.Button(self.root, text="Upload Custom Image", command=self.upload_image, width=20)
         self.upload_button.place(x=10, y=890)
 
-        self.classify_button = tk.Button(self.root, text="Classify Logo", command=self.classify_logo, width=20)
-        self.classify_button.place(x=480, y=890)
+        # self.classify_button = tk.Button(self.root, text="Classify Logo", command=self.classify_logo, width=20)
+        # self.classify_button.place(x=480, y=890)
 
         self.exit_button = tk.Button(self.root, text="Exit", command=self.root.quit, width=20)
         self.exit_button.place(x=948, y=890)
