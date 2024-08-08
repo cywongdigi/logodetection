@@ -1,4 +1,4 @@
-Here's the updated `README.txt` file for your GitHub repository:
+Sure, here's the updated `README.md` file with descriptions for `lbp`, `resnet50`, and `resnet50_lbp`:
 
 ---
 
@@ -21,7 +21,7 @@ This repository contains a logo detection system that utilizes a combination of 
 ├── custom_image                             # Custom images used for testing or training the logo detection system
 ├── gui_image                                # Snippets of the GUI for correct logo classifications
 ├── backup                                   # Backup files related to the project
-└── README.txt                               # Provides an overview, setup instructions, and usage guidelines for the logo detection system project
+└── README.md                                # Provides an overview, setup instructions, and usage guidelines for the logo detection system project
 ```
 
 ## Steps to Run `logodetection_gui.py`
@@ -62,6 +62,14 @@ python logodetection_training_testing.py --model_type <model_type>
 ```
 Replace `<model_type>` with one of the following options: `lbp`, `resnet50`, or `resnet50_lbp`.
 
+### Model Types
+
+- **lbp**: This model uses Local Binary Patterns (LBP) for feature extraction. LBP is a simple and efficient texture operator that labels the pixels of an image by thresholding the neighborhood of each pixel and considers the result as a binary number. It is particularly useful for texture classification.
+
+- **resnet50**: This model uses the ResNet-50 architecture, a deep residual network with 50 layers. ResNet-50 is a popular convolutional neural network architecture known for its effectiveness in image classification tasks. It includes skip connections or shortcuts to jump over some layers, making it easier to train deeper networks.
+
+- **resnet50_lbp**: This model combines the features extracted using ResNet-50 with the Local Binary Patterns (LBP) features. This hybrid approach leverages both the deep learning capabilities of ResNet-50 and the texture classification power of LBP, potentially improving the accuracy of logo detection and classification.
+
 ## License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
@@ -73,4 +81,4 @@ For further details, refer to the comments and documentation within each script.
 
 ---
 
-Feel free to modify this `README.md` to suit your specific needs and provide any additional information that may be necessary.
+Rename your file to `README.md` to ensure it is rendered correctly on GitHub.
