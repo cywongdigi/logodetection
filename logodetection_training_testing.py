@@ -182,19 +182,30 @@ def preprocess_data(data, model_type):
     for img in data:
         if model_type == 'lbp':
             features = extract_lbp_features(img)
+        elif model_type == 'resnet50':
+            # Normalize the image for ResNet
+            resnet_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            img = resnet_transform(img).unsqueeze(0).to(device)  # Transform and move to device
+            with torch.no_grad():
+                features = resnet50_model(img).cpu().numpy().flatten()  # Extract features
         elif model_type == 'resnet50_lbp':
             # Normalize the image for ResNet
             resnet_transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
-            resnet_features = resnet_transform(img).unsqueeze(0)
+            resnet_features = resnet_transform(img).unsqueeze(0).to(device)
+            with torch.no_grad():
+                resnet_features = resnet50_model(resnet_features).cpu().numpy().flatten()  # Extract features
 
             # Extract LBP features
             lbp_features = extract_lbp_features(img)
 
             # Combine features
-            combined_features = np.hstack((resnet_features.numpy().flatten(), lbp_features))
+            combined_features = np.hstack((resnet_features, lbp_features))
             features = combined_features
         else:
             features = img
@@ -543,3 +554,6 @@ if __name__ == "__main__":
     # Evaluate model on test data
     print("[INFO] Evaluating model on test data...")
     evaluate_model(model, test_loader)
+
+
+
